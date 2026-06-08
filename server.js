@@ -1,118 +1,120 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: { origin: "*" }
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-// Store waiting users by language
-const waitingQueues = {};
-
-io.on('connection', (socket) => {
-    console.log(`User Connected: ${socket.id}`);
-
-    socket.currentLanguage = null;
-    socket.partnerId = null;
-
-    // 🔍 FIND MATCH
-    socket.on('findMatch', (selectedLanguage) => {
-        console.log(`User ${socket.id} searching for: ${selectedLanguage}`);
-
-        socket.currentLanguage = selectedLanguage;
-
-        if (!waitingQueues[selectedLanguage]) {
-            waitingQueues[selectedLanguage] = [];
-        }
-
-        // Prevent duplicate entry
-        if (waitingQueues[selectedLanguage].includes(socket.id)) return;
-
-        // ✅ MATCH FOUND
-        if (waitingQueues[selectedLanguage].length > 0) {
-            const peerId = waitingQueues[selectedLanguage].shift();
-            const peerSocket = io.sockets.sockets.get(peerId);
-
-            if (peerSocket && peerSocket.connected) {
-
-                const roomId = `room_${socket.id}_${peerId}`;
-
-                socket.join(roomId);
-                peerSocket.join(roomId);
-
-                socket.partnerId = peerId;
-                peerSocket.partnerId = socket.id;
-
-                console.log(`Match Found! ${socket.id} ↔ ${peerId}`);
-
-                // 🔥 SEND CORRECT DATA
-                socket.emit('matchFound', {
-                    roomId: roomId,
-                    partnerId: peerId
-                });
-
-                peerSocket.emit('matchFound', {
-                    roomId: roomId,
-                    partnerId: socket.id
-                });
-
-                return;
-            }
-        }
-
-        // ⏳ WAITING
-        waitingQueues[selectedLanguage].push(socket.id);
-    });
-
-    // 🔁 NEXT USER (skip)
-    socket.on('next', () => {
-        console.log(`User ${socket.id} clicked NEXT`);
-
-        const partnerId = socket.partnerId;
-
-        if (partnerId) {
-            const partnerSocket = io.sockets.sockets.get(partnerId);
-
-            if (partnerSocket) {
-                partnerSocket.emit('partnerDisconnected');
-                partnerSocket.partnerId = null;
-            }
-        }
-
-        socket.partnerId = null;
-
-        // Rejoin queue
-        if (socket.currentLanguage) {
-            socket.emit('requeue');
-        }
-    });
-
-    // ❌ DISCONNECT
-    socket.on('disconnect', () => {
-        console.log(`User Disconnected: ${socket.id}`);
-
-        const partnerId = socket.partnerId;
-
-        if (partnerId) {
-            const partnerSocket = io.sockets.sockets.get(partnerId);
-            if (partnerSocket) {
-                partnerSocket.emit('partnerDisconnected');
-                partnerSocket.partnerId = null;
-            }
-        }
-
-        // Remove from queue
-        for (const lang in waitingQueues) {
-            waitingQueues[lang] =
-                waitingQueues[lang].filter(id => id !== socket.id);
-        }
-    });
+// Simple health check
+app.get("/", (req, res) => {
+  res.send("Lingolive Matchmaker is running 🚀");
 });
 
+// Store waiting user
+let waitingUser = null;
+
+io.on("connection", (socket) => {
+  console.log("✅ User connected:", socket.id);
+
+  // =========================
+  // FIND MATCH
+  // =========================
+  socket.on("findMatch", (data) => {
+    try {
+      console.log("📩 FIND MATCH DATA:", data);
+
+      const userId = data?.userId || socket.id;
+      const matchMode = data?.matchMode || "TEXT";
+      const targetLanguage = data?.targetLanguage || "English";
+
+      console.log(`🔎 User ${userId} searching | Mode=${matchMode} | Lang=${targetLanguage}`);
+
+      // If someone is already waiting
+      if (
+        waitingUser &&
+        waitingUser.userId !== userId &&
+        waitingUser.matchMode === matchMode
+      ) {
+        const roomId = "room_" + Date.now();
+
+        console.log(`🤝 MATCH FOUND: ${userId} ↔ ${waitingUser.userId}`);
+        console.log(`🏠 Room created: ${roomId}`);
+
+        // Join room
+        socket.join(roomId);
+        waitingUser.socket.join(roomId);
+
+        // Send match to current user
+        socket.emit("matchFound", {
+          roomId: roomId,
+          partnerId: waitingUser.userId,
+          token: "" // (optional for Agora)
+        });
+
+        // Send match to waiting user
+        waitingUser.socket.emit("matchFound", {
+          roomId: roomId,
+          partnerId: userId,
+          token: ""
+        });
+
+        // Clear waiting
+        waitingUser = null;
+
+      } else {
+        // Put current user in waiting queue
+        waitingUser = {
+          socket: socket,
+          userId: userId,
+          matchMode: matchMode,
+          targetLanguage: targetLanguage
+        };
+
+        console.log(`⏳ User waiting: ${userId}`);
+      }
+
+    } catch (err) {
+      console.error("❌ Match error:", err);
+    }
+  });
+
+  // =========================
+  // CANCEL SEARCH
+  // =========================
+  socket.on("cancelSearch", (data) => {
+    const userId = data?.userId;
+
+    if (waitingUser && waitingUser.userId === userId) {
+      console.log(`❌ Search cancelled: ${userId}`);
+      waitingUser = null;
+    }
+  });
+
+  // =========================
+  // DISCONNECT
+  // =========================
+  socket.on("disconnect", () => {
+    console.log("🔌 User disconnected:", socket.id);
+
+    if (waitingUser && waitingUser.socket === socket) {
+      console.log("🧹 Removed waiting user (disconnect)");
+      waitingUser = null;
+    }
+  });
+});
+
+// =========================
+// START SERVER
+// =========================
 const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
