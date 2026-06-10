@@ -9,112 +9,109 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
-// Simple health check
 app.get("/", (req, res) => {
-  res.send("Lingolive Matchmaker is running 🚀");
+  res.send("LingoLive Matchmaker is running");
 });
 
-// Store waiting user
-let waitingUser = null;
+const waitingUsers = {
+  TEXT: null,
+  VIDEO: null
+};
+
+function cleanWaitingUser(mode, socket) {
+  if (waitingUsers[mode] && waitingUsers[mode].socket.id === socket.id) {
+    waitingUsers[mode] = null;
+  }
+}
 
 io.on("connection", (socket) => {
-  console.log("✅ User connected:", socket.id);
+  console.log("User connected:", socket.id);
 
-  // =========================
-  // FIND MATCH
-  // =========================
-  socket.on("findMatch", (data) => {
+  socket.on("findMatch", (data = {}) => {
     try {
-      console.log("📩 FIND MATCH DATA:", data);
+      const userId = data.userId || socket.id;
+      const matchMode = data.matchMode === "VIDEO" ? "VIDEO" : "TEXT";
+      const targetLanguage = data.targetLanguage || "English";
 
-      const userId = data?.userId || socket.id;
-      const matchMode = data?.matchMode || "TEXT";
-      const targetLanguage = data?.targetLanguage || "English";
+      console.log(
+        `Finding match: user=${userId}, mode=${matchMode}, language=${targetLanguage}`
+      );
 
-      console.log(`🔎 User ${userId} searching | Mode=${matchMode} | Lang=${targetLanguage}`);
+      const waitingUser = waitingUsers[matchMode];
 
-      // If someone is already waiting
       if (
         waitingUser &&
         waitingUser.userId !== userId &&
-        waitingUser.matchMode === matchMode
+        waitingUser.socket.connected
       ) {
         const roomId = "room_" + Date.now();
 
-        console.log(`🤝 MATCH FOUND: ${userId} ↔ ${waitingUser.userId}`);
-        console.log(`🏠 Room created: ${roomId}`);
-
-        // Join room
         socket.join(roomId);
         waitingUser.socket.join(roomId);
 
-        // Send match to current user
         socket.emit("matchFound", {
-          roomId: roomId,
+          roomId,
           partnerId: waitingUser.userId,
-          token: "" // (optional for Agora)
+          token: ""
         });
 
-        // Send match to waiting user
         waitingUser.socket.emit("matchFound", {
-          roomId: roomId,
+          roomId,
           partnerId: userId,
           token: ""
         });
 
-        // Clear waiting
-        waitingUser = null;
+        console.log(`Match found: ${userId} with ${waitingUser.userId}, room=${roomId}`);
 
+        waitingUsers[matchMode] = null;
       } else {
-        // Put current user in waiting queue
-        waitingUser = {
-          socket: socket,
-          userId: userId,
-          matchMode: matchMode,
-          targetLanguage: targetLanguage
+        waitingUsers[matchMode] = {
+          socket,
+          userId,
+          matchMode,
+          targetLanguage
         };
 
-        console.log(`⏳ User waiting: ${userId}`);
+        console.log(`User waiting: ${userId}, mode=${matchMode}`);
       }
-
     } catch (err) {
-      console.error("❌ Match error:", err);
+      console.error("Match error:", err);
+      socket.emit("matchError", {
+        message: "Could not start matchmaking"
+      });
     }
   });
 
-  // =========================
-  // CANCEL SEARCH
-  // =========================
-  socket.on("cancelSearch", (data) => {
-    const userId = data?.userId;
+  socket.on("cancelSearch", (data = {}) => {
+    const userId = data.userId;
 
-    if (waitingUser && waitingUser.userId === userId) {
-      console.log(`❌ Search cancelled: ${userId}`);
-      waitingUser = null;
-    }
+    ["TEXT", "VIDEO"].forEach((mode) => {
+      if (
+        waitingUsers[mode] &&
+        (!userId || waitingUsers[mode].userId === userId || waitingUsers[mode].socket.id === socket.id)
+      ) {
+        waitingUsers[mode] = null;
+        console.log(`Search cancelled: ${userId || socket.id}`);
+      }
+    });
   });
 
-  // =========================
-  // DISCONNECT
-  // =========================
   socket.on("disconnect", () => {
-    console.log("🔌 User disconnected:", socket.id);
+    console.log("User disconnected:", socket.id);
 
-    if (waitingUser && waitingUser.socket === socket) {
-      console.log("🧹 Removed waiting user (disconnect)");
-      waitingUser = null;
-    }
+    cleanWaitingUser("TEXT", socket);
+    cleanWaitingUser("VIDEO", socket);
   });
 });
 
-// =========================
-// START SERVER
-// =========================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
