@@ -1,117 +1,87 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
+socket.on("findMatch", (data = {}) => {
 
-const app = express();
-const server = http.createServer(app);
+    const userId = data.userId || socket.id;
+    const matchMode = data.matchMode === "VIDEO" ? "VIDEO" : "TEXT";
+    const targetLanguage = data.targetLanguage || "English";
 
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
-  allowEIO3: true,
-  pingTimeout: 60000,
-  pingInterval: 25000
-});
+    console.log(
+        `Finding match: ${userId} (${matchMode})`
+    );
 
-app.get("/", (req, res) => {
-  res.send("LingoLive Matchmaker is running");
-});
+    const queue = waitingQueues[matchMode];
 
-const waitingUsers = {
-  TEXT: null,
-  VIDEO: null
-};
+    // Remove duplicate entries
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].userId === userId) {
+            queue.splice(i, 1);
+        }
+    }
 
-function cleanWaitingUser(mode, socket) {
-  if (waitingUsers[mode] && waitingUsers[mode].socket.id === socket.id) {
-    waitingUsers[mode] = null;
-  }
-}
+    let partner = null;
 
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+    while (queue.length > 0) {
 
-  socket.on("findMatch", (data = {}) => {
-    try {
-      const userId = data.userId || socket.id;
-      const matchMode = data.matchMode === "VIDEO" ? "VIDEO" : "TEXT";
-      const targetLanguage = data.targetLanguage || "English";
+        const candidate = queue.shift();
 
-      console.log(
-        `Finding match: user=${userId}, mode=${matchMode}, language=${targetLanguage}`
-      );
+        if (
+            candidate &&
+            candidate.socket &&
+            candidate.socket.connected &&
+            candidate.userId !== userId
+        ) {
+            partner = candidate;
+            break;
+        }
+    }
 
-      const waitingUser = waitingUsers[matchMode];
+    if (partner) {
 
-      if (
-        waitingUser &&
-        waitingUser.userId !== userId &&
-        waitingUser.socket.connected
-      ) {
-        const roomId = "room_" + Date.now();
+        const roomId =
+            "room_" +
+            Date.now() +
+            "_" +
+            Math.random().toString(36).substring(2, 8);
 
         socket.join(roomId);
-        waitingUser.socket.join(roomId);
+        partner.socket.join(roomId);
 
-        socket.emit("matchFound", {
-          roomId,
-          partnerId: waitingUser.userId,
-          token: ""
-        });
-
-        waitingUser.socket.emit("matchFound", {
-          roomId,
-          partnerId: userId,
-          token: ""
-        });
-
-        console.log(`Match found: ${userId} with ${waitingUser.userId}, room=${roomId}`);
-
-        waitingUsers[matchMode] = null;
-      } else {
-        waitingUsers[matchMode] = {
-          socket,
-          userId,
-          matchMode,
-          targetLanguage
+        const payloadA = {
+            roomId,
+            partnerId: partner.userId,
+            token: "",
+            timestamp: Date.now()
         };
 
-        console.log(`User waiting: ${userId}, mode=${matchMode}`);
-      }
-    } catch (err) {
-      console.error("Match error:", err);
-      socket.emit("matchError", {
-        message: "Could not start matchmaking"
-      });
+        const payloadB = {
+            roomId,
+            partnerId: userId,
+            token: "",
+            timestamp: Date.now()
+        };
+
+        socket.emit("matchFound", payloadA);
+        partner.socket.emit("matchFound", payloadB);
+
+        console.log(
+            `MATCHED ${userId} ↔ ${partner.userId} (${roomId})`
+        );
+
+    } else {
+
+        queue.push({
+            socket,
+            userId,
+            matchMode,
+            targetLanguage,
+            createdAt: Date.now()
+        });
+
+        socket.emit("waiting", {
+            message: "Waiting for partner..."
+        });
+
+        console.log(
+            `WAITING ${userId} (${matchMode}) queue=${queue.length}`
+        );
     }
-  });
-
-  socket.on("cancelSearch", (data = {}) => {
-    const userId = data.userId;
-
-    ["TEXT", "VIDEO"].forEach((mode) => {
-      if (
-        waitingUsers[mode] &&
-        (!userId || waitingUsers[mode].userId === userId || waitingUsers[mode].socket.id === socket.id)
-      ) {
-        waitingUsers[mode] = null;
-        console.log(`Search cancelled: ${userId || socket.id}`);
-      }
-    });
-  });
-
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
-
-    cleanWaitingUser("TEXT", socket);
-    cleanWaitingUser("VIDEO", socket);
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
 });
