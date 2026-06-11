@@ -9,320 +9,302 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    },
-    allowEIO3: true,
-    pingTimeout: 60000,
-    pingInterval: 25000,
-    transports: ["websocket", "polling"]
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ["websocket", "polling"]
 });
 
+const WAITING_TTL_MS = 30000;
+const CLEANUP_INTERVAL_MS = 10000;
+
 const waitingQueues = {
-    TEXT: [],
-    VIDEO: []
+  TEXT: [],
+  VIDEO: []
 };
 
-const activeMatches = new Map();
+const socketState = new Map();
 
 app.get("/", (req, res) => {
-    res.json({
-        status: "running",
-        service: "LingoLive Matchmaker",
-        uptime: process.uptime(),
-        textWaiting: waitingQueues.TEXT.length,
-        videoWaiting: waitingQueues.VIDEO.length
-    });
+  res.status(200).json({
+    ok: true,
+    service: "LingoLive Matchmaker",
+    status: "running",
+    uptime: process.uptime(),
+    waiting: {
+      TEXT: waitingQueues.TEXT.length,
+      VIDEO: waitingQueues.VIDEO.length
+    }
+  });
 });
 
 app.get("/health", (req, res) => {
-    res.json({
-        status: "ok",
-        timestamp: Date.now(),
-        textWaiting: waitingQueues.TEXT.length,
-        videoWaiting: waitingQueues.VIDEO.length
-    });
+  res.status(200).json({
+    ok: true,
+    timestamp: Date.now()
+  });
 });
 
-function generateRoomId(userA, userB, mode) {
-    const hash = crypto
-        .createHash("md5")
-        .update(
-            `${userA}_${userB}_${mode}_${Date.now()}_${Math.random()}`
-        )
-        .digest("hex")
-        .substring(0, 12);
-
-    return `room_${mode}_${hash}`;
+function normalizeMode(mode) {
+  return mode === "VIDEO" ? "VIDEO" : "TEXT";
 }
 
-function removeUserFromQueues(userId, socketId) {
-    ["TEXT", "VIDEO"].forEach(mode => {
-        waitingQueues[mode] =
-            waitingQueues[mode].filter(
-                item =>
-                    item.userId !== userId &&
-                    item.socket.id !== socketId
-            );
-    });
+function cleanUserId(userId, socketId) {
+  return typeof userId === "string" && userId.trim()
+    ? userId.trim()
+    : socketId;
 }
 
-function cleanupStaleUsers() {
-    const now = Date.now();
+function cleanLanguage(language) {
+  return typeof language === "string" && language.trim()
+    ? language.trim()
+    : "English";
+}
 
-    ["TEXT", "VIDEO"].forEach(mode => {
+function buildRoomId(userA, userB, mode) {
+  const sorted = [userA, userB].sort();
+  const hash = crypto
+    .createHash("sha256")
+    .update(`${sorted[0]}_${sorted[1]}_${mode}_${Date.now()}_${Math.random()}`)
+    .digest("hex")
+    .slice(0, 12);
 
-        waitingQueues[mode] =
-            waitingQueues[mode].filter(item => {
+  return `room_${mode}_${hash}`;
+}
 
-                const alive =
-                    item &&
-                    item.socket &&
-                    item.socket.connected &&
-                    now - item.createdAt < 30000;
+function removeSocketFromQueues(socketId) {
+  ["TEXT", "VIDEO"].forEach(mode => {
+    waitingQueues[mode] = waitingQueues[mode].filter(
+      item => item.socket.id !== socketId
+    );
+  });
+}
 
-                if (!alive) {
-                    console.log(
-                        `Removing stale user ${item.userId}`
-                    );
-                }
+function removeUserFromQueues(userId) {
+  if (!userId) return;
 
-                return alive;
-            });
+  ["TEXT", "VIDEO"].forEach(mode => {
+    waitingQueues[mode] = waitingQueues[mode].filter(
+      item => item.userId !== userId
+    );
+  });
+}
+
+function cleanupExpiredUsers() {
+  const now = Date.now();
+
+  ["TEXT", "VIDEO"].forEach(mode => {
+    waitingQueues[mode] = waitingQueues[mode].filter(item => {
+      const alive =
+        item &&
+        item.socket &&
+        item.socket.connected &&
+        now - item.createdAt <= WAITING_TTL_MS;
+
+      if (!alive && item && item.socket && item.socket.connected) {
+        item.socket.emit("matchTimeout", {
+          message: "Search expired. Please try again.",
+          timestamp: Date.now()
+        });
+      }
+
+      return alive;
     });
+  });
 }
 
 function findPartner(mode, userId) {
+  cleanupExpiredUsers();
 
-    cleanupStaleUsers();
+  const queue = waitingQueues[mode];
 
-    const queue = waitingQueues[mode];
+  while (queue.length > 0) {
+    const candidate = queue.shift();
 
-    while (queue.length > 0) {
-
-        const candidate = queue.shift();
-
-        if (
-            candidate &&
-            candidate.socket &&
-            candidate.socket.connected &&
-            candidate.userId !== userId
-        ) {
-            return candidate;
-        }
+    if (
+      candidate &&
+      candidate.socket &&
+      candidate.socket.connected &&
+      candidate.userId !== userId
+    ) {
+      return candidate;
     }
+  }
 
-    return null;
+  return null;
+}
+
+function addWaitingUser(socket, userId, matchMode, targetLanguage) {
+  removeSocketFromQueues(socket.id);
+  removeUserFromQueues(userId);
+
+  waitingQueues[matchMode].push({
+    socket,
+    userId,
+    matchMode,
+    targetLanguage,
+    createdAt: Date.now()
+  });
+
+  socketState.set(socket.id, {
+    userId,
+    matchMode,
+    status: "waiting"
+  });
+
+  socket.emit("waiting", {
+    mode: matchMode,
+    message: "Waiting for partner...",
+    timestamp: Date.now()
+  });
+
+  console.log(`WAITING user=${userId}, mode=${matchMode}, queue=${waitingQueues[matchMode].length}`);
+}
+
+function emitMatch(socketA, userA, socketB, userB, mode, targetLanguage) {
+  const roomId = buildRoomId(userA, userB, mode);
+  const timestamp = Date.now();
+
+  socketA.join(roomId);
+  socketB.join(roomId);
+
+  socketState.set(socketA.id, {
+    userId: userA,
+    matchMode: mode,
+    status: "matched",
+    roomId,
+    partnerId: userB
+  });
+
+  socketState.set(socketB.id, {
+    userId: userB,
+    matchMode: mode,
+    status: "matched",
+    roomId,
+    partnerId: userA
+  });
+
+  socketA.emit("matchFound", {
+    roomId,
+    partnerId: userB,
+    matchMode: mode,
+    targetLanguage,
+    token: "",
+    timestamp
+  });
+
+  socketB.emit("matchFound", {
+    roomId,
+    partnerId: userA,
+    matchMode: mode,
+    targetLanguage,
+    token: "",
+    timestamp
+  });
+
+  console.log(`MATCH FOUND ${userA} ↔ ${userB}, mode=${mode}, room=${roomId}`);
 }
 
 io.on("connection", socket => {
+  console.log("User connected:", socket.id);
 
-    console.log("User connected:", socket.id);
+  socket.emit("connected", {
+    socketId: socket.id,
+    timestamp: Date.now()
+  });
 
-    socket.emit("connected", {
-        socketId: socket.id,
+  socket.on("findMatch", (data = {}) => {
+    try {
+      const userId = cleanUserId(data.userId, socket.id);
+      const matchMode = normalizeMode(data.matchMode);
+      const targetLanguage = cleanLanguage(data.targetLanguage);
+
+      console.log(`Finding match user=${userId}, mode=${matchMode}`);
+
+      removeSocketFromQueues(socket.id);
+      removeUserFromQueues(userId);
+
+      const partner = findPartner(matchMode, userId);
+
+      if (partner) {
+        emitMatch(
+          socket,
+          userId,
+          partner.socket,
+          partner.userId,
+          matchMode,
+          targetLanguage
+        );
+      } else {
+        addWaitingUser(socket, userId, matchMode, targetLanguage);
+      }
+    } catch (err) {
+      console.error("Match error:", err);
+      socket.emit("matchError", {
+        message: "Could not start matchmaking",
         timestamp: Date.now()
+      });
+    }
+  });
+
+  socket.on("cancelSearch", (data = {}) => {
+    const userId = cleanUserId(data.userId, socket.id);
+
+    removeSocketFromQueues(socket.id);
+    removeUserFromQueues(userId);
+
+    socket.emit("searchCancelled", {
+      ok: true,
+      timestamp: Date.now()
     });
 
-    socket.on("findMatch", (data = {}) => {
+    console.log(`Search cancelled user=${userId}`);
+  });
 
-        try {
+  socket.on("callEnded", data => {
+    if (data && data.roomId) {
+      socket.to(data.roomId).emit("partnerEndedCall", {
+        roomId: data.roomId,
+        timestamp: Date.now()
+      });
+    }
+  });
 
-            const userId =
-                data.userId || socket.id;
+  socket.on("reportAndBlockUser", data => {
+    console.log("Report received:", data);
 
-            const matchMode =
-                data.matchMode === "VIDEO"
-                    ? "VIDEO"
-                    : "TEXT";
-
-            const targetLanguage =
-                data.targetLanguage || "English";
-
-            console.log(
-                `Finding match user=${userId} mode=${matchMode}`
-            );
-
-            removeUserFromQueues(
-                userId,
-                socket.id
-            );
-
-            const partner =
-                findPartner(
-                    matchMode,
-                    userId
-                );
-
-            if (partner) {
-
-                const roomId =
-                    generateRoomId(
-                        userId,
-                        partner.userId,
-                        matchMode
-                    );
-
-                socket.join(roomId);
-                partner.socket.join(roomId);
-
-                activeMatches.set(roomId, {
-                    roomId,
-                    userA: userId,
-                    userB: partner.userId,
-                    createdAt: Date.now()
-                });
-
-                socket.emit("matchFound", {
-                    roomId,
-                    partnerId: partner.userId,
-                    token: "",
-                    targetLanguage,
-                    timestamp: Date.now()
-                });
-
-                partner.socket.emit("matchFound", {
-                    roomId,
-                    partnerId: userId,
-                    token: "",
-                    targetLanguage,
-                    timestamp: Date.now()
-                });
-
-                console.log(
-                    `MATCH FOUND ${userId} ↔ ${partner.userId}`
-                );
-
-            } else {
-
-                waitingQueues[matchMode].push({
-                    socket,
-                    userId,
-                    matchMode,
-                    targetLanguage,
-                    createdAt: Date.now()
-                });
-
-                socket.emit("waiting", {
-                    message: "Waiting for partner..."
-                });
-
-                console.log(
-                    `WAITING ${userId} queue=${waitingQueues[matchMode].length}`
-                );
-            }
-
-        } catch (err) {
-
-            console.error(
-                "Match error:",
-                err
-            );
-
-            socket.emit("matchError", {
-                message:
-                    "Could not start matchmaking"
-            });
-        }
+    socket.emit("reportReceived", {
+      ok: true,
+      timestamp: Date.now()
     });
+  });
 
-    socket.on("cancelSearch", (data = {}) => {
+  socket.on("disconnect", reason => {
+    console.log("User disconnected:", socket.id, reason);
 
-        const userId =
-            data.userId || socket.id;
+    removeSocketFromQueues(socket.id);
 
-        removeUserFromQueues(
-            userId,
-            socket.id
-        );
+    const state = socketState.get(socket.id);
 
-        socket.emit("searchCancelled", {
-            success: true
-        });
+    if (state && state.roomId) {
+      socket.to(state.roomId).emit("partnerDisconnected", {
+        roomId: state.roomId,
+        partnerId: state.userId,
+        reason,
+        timestamp: Date.now()
+      });
+    }
 
-        console.log(
-            `Search cancelled ${userId}`
-        );
-    });
-
-    socket.on("callEnded", data => {
-
-        if (
-            data &&
-            data.roomId &&
-            activeMatches.has(data.roomId)
-        ) {
-
-            activeMatches.delete(
-                data.roomId
-            );
-
-            socket.to(data.roomId).emit(
-                "partnerEndedCall",
-                {
-                    roomId: data.roomId
-                }
-            );
-
-            console.log(
-                `Call ended ${data.roomId}`
-            );
-        }
-    });
-
-    socket.on("reportAndBlockUser", data => {
-
-        console.log(
-            "Report received:",
-            data
-        );
-
-        socket.emit(
-            "reportReceived",
-            {
-                success: true
-            }
-        );
-    });
-
-    socket.on("disconnect", reason => {
-
-        console.log(
-            "User disconnected:",
-            socket.id,
-            reason
-        );
-
-        removeUserFromQueues(
-            null,
-            socket.id
-        );
-
-        activeMatches.forEach(match => {
-
-            if (
-                match.userA === socket.id ||
-                match.userB === socket.id
-            ) {
-
-                socket.to(match.roomId).emit(
-                    "partnerDisconnected",
-                    {
-                        roomId: match.roomId
-                    }
-                );
-            }
-        });
-    });
+    socketState.delete(socket.id);
+  });
 });
 
-setInterval(() => {
-    cleanupStaleUsers();
-}, 10000);
+setInterval(cleanupExpiredUsers, CLEANUP_INTERVAL_MS);
 
 server.listen(PORT, () => {
-    console.log(
-        `LingoLive Matchmaker running on port ${PORT}`
-    );
+  console.log(`LingoLive Matchmaker running on port ${PORT}`);
 });
